@@ -33,8 +33,22 @@
         
         .header h1 {
             margin: 0;
-            font-size: 24px;
+            font-size: 26px;
             color: #2f3748;
+            display: flex;
+            align-items: center;
+        }
+        
+        .header h1:before {
+            content: "";
+            display: inline-block;
+            width: 24px;
+            height: 24px;
+            margin-right: 10px;
+            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232b7de9' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpath d='M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'%3e%3c/path%3e%3c/svg%3e");
+            background-repeat: no-repeat;
+            background-position: center;
+            background-size: contain;
         }
         
         .session-info {
@@ -49,22 +63,50 @@
         .selector-container {
             display: flex;
             align-items: center;
-            margin-top: 10px;
+            margin: 15px 0;
+            background-color: #fff;
+            padding: 12px 15px;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
         }
         
         .selector-container label {
-            margin-right: 10px;
+            margin-right: 15px;
             font-size: 14px;
+            font-weight: 500;
             color: #333;
         }
         
         #option-selector {
-            padding: 8px;
-            border-radius: 6px;
-            border: 1px solid #dfe1e5;
+            flex: 1;
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 2px solid #e1e4e8;
+            border-right: 12px solid #e1e4e8;
             background-color: white;
-            font-size: 14px;
-            min-width: 150px;
+            font-size: 15px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            appearance: none;
+            -webkit-appearance: none;
+            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23555' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+            background-repeat: no-repeat;
+            background-position: right 8px center;
+            background-size: 16px;
+            padding-right: 32px;
+        }
+        
+        #option-selector:focus {
+            outline: none;
+            border-color: #2b7de9;
+            border-right-color: #2b7de9;
+            box-shadow: 0 0 0 2px rgba(43, 125, 233, 0.2);
+        }
+        
+        #option-selector:hover {
+            border-color: #2b7de9;
+            border-right-color: #2b7de9;
         }
         
         .chat-container {
@@ -141,12 +183,13 @@
                 <span id="session-id">Connecting...</span>
             </div>
             <div class="selector-container">
-                <label for="option-selector">Select Option:</label>
+                <label for="option-selector">Choose Model:</label>
                 <select id="option-selector">
-                    <option value="option1">Option 1</option>
-                    <option value="option2">Option 2</option>
-                    <option value="option3">Option 3</option>
-                    <option value="option4">Option 4</option>
+                    <option value="gpt4">GPT-4 Turbo</option>
+                    <option value="claude3">Claude 3 Opus</option>
+                    <option value="llama3">Llama 3 70B</option>
+                    <option value="mistral">Mistral Large</option>
+                    <option value="gemini">Gemini Pro</option>
                 </select>
             </div>
         </div>
@@ -168,7 +211,7 @@
         const CHAT_ENDPOINT = '/chat';
         
         let sessionId = '';
-        let selectedOption = 'option1'; // Default option
+        let             selectedOption = 'gpt4'; // Default option
         
         const messageInput = document.getElementById('message-input');
         const sendButton = document.getElementById('send-button');
