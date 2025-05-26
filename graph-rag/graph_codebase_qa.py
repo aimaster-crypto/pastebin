@@ -413,17 +413,23 @@ class SpringBootIndexer:
                         annotations=json.dumps(chunk.annotations or [])
                     )
                 for rel_type, source, target in relationships:
-                    session.run(
-                        """
-                        MATCH (source:CodeChunk {codebase_name: $codebase_name, name: $source_name})
-                        MATCH (target:CodeChunk {codebase_name: $codebase_name, name: $target_name})
-                        MERGE (source)-[:$rel_type]->(target)
-                        """,
-                        codebase_name=self.codebase_name,
-                        source_name=source,
-                        target_name=target,
-                        rel_type=rel_type
-                    )
+                    if rel_type not in ['CALLS', 'EXTENDS', 'IMPLEMENTS']:
+                        print(f"Invalid relationship type '{rel_type}' in {file_path}. Skipping.")
+                        continue
+                    query = f"""
+                        MATCH (source:CodeChunk {{codebase_name: $codebase_name, name: $source_name}})
+                        MATCH (target:CodeChunk {{codebase_name: $codebase_name, name: $target_name}})
+                        MERGE (source)-[:{rel_type}]->(target)
+                    """
+                    try:
+                        session.run(
+                            query,
+                            codebase_name=self.codebase_name,
+                            source_name=source,
+                            target_name=target
+                        )
+                    except Exception as e:
+                        print(f"Error creating {rel_type} relationship for {source} -> {target} in {file_path}: {e}")
         
         except Exception as e:
             print(f"Error parsing {file_path}: {e}")
