@@ -11,12 +11,15 @@ import time
 import re
 import xml.etree.ElementTree as ET
 import uuid
-from tree_sitter import Language, Parser
+from tree_sitter_languages import get_language, get_parser
 
 # Initialize tree-sitter for Java
-JAVA_LANGUAGE = Language('build/java.so', 'java')
-parser = Parser()
-parser.set_language(JAVA_LANGUAGE)
+try:
+    JAVA_LANGUAGE = get_language('java')
+    parser = get_parser('java')
+except Exception as e:
+    print(f"Error initializing tree-sitter: {e}")
+    raise
 
 @dataclass
 class CodeChunk:
@@ -88,8 +91,7 @@ class OllamaLLM:
             )
             if response.status_code == 200:
                 return response.json()['response']
-            else:
-                return f"Error: {response.text}"
+            return f"Error: {response.text}"
         except Exception as e:
             return f"Error generating response: {e}"
 
@@ -155,9 +157,10 @@ class SpringBootIndexer:
             
             # Extract package
             package_name = ""
-            for node in root_node.children:
-                if node.type == 'package_declaration':
-                    package_name = content[node.start_byte:node.end_byte].split('package ')[1].strip(';\n')
+            query_package = JAVA_LANGUAGE.query("(package_declaration (scoped_identifier) @package)")
+            for capture in query_package.captures(root_node):
+                if capture[1] == 'package':
+                    package_name = content[capture[0].start_byte:capture[0].end_byte]
             
             spring_annotations = [
                 'SpringBootApplication', 'RestController', 'Controller', 'Service', 
@@ -175,43 +178,101 @@ class SpringBootIndexer:
                 return start_line, end_line
             
             # Process class, interface, enum declarations
-            for node in root_node.walk():
-                if node.type in ['class_declaration', 'interface_declaration', 'enum_declaration']:
-                    class_name = ""
-                    extends = []
-                    implements = []
-                    annotations = []
+            query_classes = JAVA_LANGUAGE.query("""
+                (class_declaration
+                    name: (identifier) @name
+                    (superclass (identifier) @super)? 
+                    (super_interfaces (identifier) @interface)*) @class
+                (interface_declaration
+                    name: (identifier) @name) @interface
+                (enum_declaration
+                    name: (identifier) @name) @enum
+                (annotation
+                    name: (identifier) @annotation)
+            """)
+            captures = query_classes.captures(root_node)
+            current_class = None
+            annotations = []
+            extends = []
+            implements = []
+            
+            for node, capture_name in captures:
+                if capture_name == 'annotation':
+                    ann_name = get_node_text(node)
+                    if ann_name in spring_annotations:
+                        annotations.append(f'@{ann_name}')
+                elif capture_name in ['class', 'interface', 'enum']:
+                    if current_class:
+                        # Process previous class
+                        chunk_type = 'class' if current_class['type'] == 'class' else 'interface' if current_class['type'] == 'interface' else 'enum'
+                        if 'test' in current_class['name'].lower():
+                            print(f"Skipping test class: {current_class['name']} in {file_path}")
+                            current_class = None
+                            annotations = []
+                            extends = []
+                            implements = []
+                            continue
+                        
+                        start_line, end_line = current_class['start_line'], current_class['end_line']
+                        class_content = current_class['content']
+                        
+                        enhanced_content = f"// Module: {module_name}\n// Package: {package_name}\n"
+                        if annotations:
+                            enhanced_content += f"// Annotations: {', '.join(annotations)}\n"
+                        enhanced_content += f"// {chunk_type.title()}: {current_class['name']}\n\n"
+                        enhanced_content += class_content
+                        
+                        node_id = str(uuid.uuid4())
+                        chunk = CodeChunk(
+                            file_path=file_path,
+                            content=enhanced_content,
+                            start_line=start_line,
+                            end_line=end_line,
+                            chunk_type=chunk_type,
+                            name=current_class['name'],
+                            package=package_name,
+                            annotations=annotations,
+                            embedding=None,
+                            node_id=node_id
+                        )
+                        chunks.append(chunk)
+                        
+                        for ext in extends:
+                            relationships.append(('EXTENDS', current_class['name'], ext))
+                        for impl in implements:
+                            relationships.append(('IMPLEMENTS', current_class['name'], impl))
+                        
+                        annotations = []
+                        extends = []
+                        implements = []
                     
-                    # Get class/interface/enum name
-                    for child in node.children:
-                        if child.type == 'identifier':
-                            class_name = get_node_text(child)
-                        elif child.type == 'superclass':
-                            for ext in child.children:
-                                if ext.type == 'identifier':
-                                    extends.append(get_node_text(ext))
-                        elif child.type == 'super_interfaces':
-                            for impl in child.children:
-                                if impl.type == 'identifier':
-                                    implements.append(get_node_text(impl))
-                        elif child.type == 'annotation':
-                            ann_name = get_node_text(child).split('(')[0].lstrip('@')
-                            if ann_name in spring_annotations:
-                                annotations.append(f'@{ann_name}')
-                    
-                    # Skip test classes
-                    if 'test' in class_name.lower():
-                        print(f"Skipping test class: {class_name} in {file_path}")
-                        continue
-                    
-                    chunk_type = 'class' if node.type == 'class_declaration' else 'interface' if node.type == 'interface_declaration' else 'enum'
-                    start_line, end_line = get_line_numbers(node)
-                    class_content = get_node_text(node)
+                    current_class = {
+                        'type': capture_name,
+                        'name': '',
+                        'content': get_node_text(node),
+                        'start_line': get_line_numbers(node)[0],
+                        'end_line': get_line_numbers(node)[1]
+                    }
+                elif capture_name == 'name' and current_class:
+                    current_class['name'] = get_node_text(node)
+                elif capture_name == 'super' and current_class:
+                    extends.append(get_node_text(node))
+                elif capture_name == 'interface' and current_class:
+                    implements.append(get_node_text(node))
+            
+            # Process last class
+            if current_class:
+                chunk_type = 'class' if current_class['type'] == 'class' else 'interface' if current_class['type'] == 'interface' else 'enum'
+                if 'test' in current_class['name'].lower():
+                    print(f"Skipping test class: {current_class['name']} in {file_path}")
+                else:
+                    start_line, end_line = current_class['start_line'], current_class['end_line']
+                    class_content = current_class['content']
                     
                     enhanced_content = f"// Module: {module_name}\n// Package: {package_name}\n"
                     if annotations:
                         enhanced_content += f"// Annotations: {', '.join(annotations)}\n"
-                    enhanced_content += f"// {chunk_type.title()}: {class_name}\n\n"
+                    enhanced_content += f"// {chunk_type.title()}: {current_class['name']}\n\n"
                     enhanced_content += class_content
                     
                     node_id = str(uuid.uuid4())
@@ -221,7 +282,7 @@ class SpringBootIndexer:
                         start_line=start_line,
                         end_line=end_line,
                         chunk_type=chunk_type,
-                        name=class_name,
+                        name=current_class['name'],
                         package=package_name,
                         annotations=annotations,
                         embedding=None,
@@ -230,60 +291,87 @@ class SpringBootIndexer:
                     chunks.append(chunk)
                     
                     for ext in extends:
-                        relationships.append(('EXTENDS', class_name, ext))
+                        relationships.append(('EXTENDS', current_class['name'], ext))
                     for impl in implements:
-                        relationships.append(('IMPLEMENTS', class_name, impl))
+                        relationships.append(('IMPLEMENTS', current_class['name'], impl))
             
             # Process methods and method calls
-            for node in root_node.walk():
-                if node.type == 'method_declaration':
-                    method_name = ""
-                    annotations = []
-                    for child in node.children:
-                        if child.type == 'identifier':
-                            method_name = get_node_text(child)
-                        elif child.type == 'annotation':
-                            ann_name = get_node_text(child).split('(')[0].lstrip('@')
-                            if ann_name in spring_annotations:
-                                annotations.append(f'@{ann_name}')
+            query_methods = JAVA_LANGUAGE.query("""
+                (method_declaration
+                    name: (identifier) @name
+                    (annotation)* @annotation)
+                (method_invocation
+                    name: (identifier) @call_name)
+            """)
+            captures = query_methods.captures(root_node)
+            current_method = None
+            method_annotations = []
+            
+            for node, capture_name in captures:
+                if capture_name == 'annotation':
+                    ann_name = get_node_text(node)
+                    if ann_name in spring_annotations:
+                        method_annotations.append(f'@{ann_name}')
+                elif capture_name == 'name':
+                    if current_method:
+                        # Process previous method
+                        if current_method['name'] not in ['get', 'set', 'is'] and not current_method['name'][0].isupper():
+                            if len(current_method['content']) > 50:
+                                enhanced_content = f"// Module: {module_name}\n// Package: {package_name}\n"
+                                if method_annotations:
+                                    enhanced_content += f"// Annotations: {', '.join(method_annotations)}\n"
+                                enhanced_content += f"// Method: {current_method['name']}\n\n"
+                                enhanced_content += current_method['content']
+                                
+                                node_id = str(uuid.uuid4())
+                                chunk = CodeChunk(
+                                    file_path=file_path,
+                                    content=enhanced_content,
+                                    start_line=current_method['start_line'],
+                                    end_line=current_method['end_line'],
+                                    chunk_type='method',
+                                    name=current_method['name'],
+                                    package=package_name,
+                                    annotations=method_annotations,
+                                    embedding=None,
+                                    node_id=node_id
+                                )
+                                chunks.append(chunk)
+                        method_annotations = []
                     
-                    if method_name in ['get', 'set', 'is'] or method_name[0].isupper():
-                        continue
+                    current_method = {
+                        'name': get_node_text(node),
+                        'content': get_node_text(node.parent),
+                        'start_line': get_line_numbers(node.parent)[0],
+                        'end_line': get_line_numbers(node.parent)[1]
+                    }
+                elif capture_name == 'call_name' and current_method:
+                    called_method = get_node_text(node)
+                    relationships.append(('CALLS', current_method['name'], called_method))
+            
+            # Process last method
+            if current_method and current_method['name'] not in ['get', 'set', 'is'] and not current_method['name'][0].isupper():
+                if len(current_method['content']) > 50:
+                    enhanced_content = f"// Module: {module_name}\n// Package: {package_name}\n"
+                    if method_annotations:
+                        enhanced_content += f"// Annotations: {', '.join(method_annotations)}\n"
+                    enhanced_content += f"// Method: {current_method['name']}\n\n"
+                    enhanced_content += current_method['content']
                     
-                    start_line, end_line = get_line_numbers(node)
-                    method_content = get_node_text(node)
-                    if len(method_content) > 50:
-                        enhanced_content = f"// Module: {module_name}\n// Package: {package_name}\n"
-                        if annotations:
-                            enhanced_content += f"// Annotations: {', '.join(annotations)}\n"
-                        enhanced_content += f"// Method: {method_name}\n\n"
-                        enhanced_content += method_content
-                        
-                        node_id = str(uuid.uuid4())
-                        chunk = CodeChunk(
-                            file_path=file_path,
-                            content=enhanced_content,
-                            start_line=start_line,
-                            end_line=end_line,
-                            chunk_type='method',
-                            name=method_name,
-                            package=package_name,
-                            annotations=annotations,
-                            embedding=None,
-                            node_id=node_id
-                        )
-                        chunks.append(chunk)
-                        
-                        # Find method calls
-                        for child in node.walk():
-                            if child.type == 'method_invocation':
-                                called_method = ""
-                                for subchild in child.children:
-                                    if subchild.type == 'identifier':
-                                        called_method = get_node_text(subchild)
-                                        break
-                                if called_method:
-                                    relationships.append(('CALLS', method_name, called_method))
+                    node_id = str(uuid.uuid4())
+                    chunk = CodeChunk(
+                        file_path=file_path,
+                        content=enhanced_content,
+                        start_line=current_method['start_line'],
+                        end_line=current_method['end_line'],
+                        chunk_type='method',
+                        name=current_method['name'],
+                        package=package_name,
+                        annotations=method_annotations,
+                        embedding=None,
+                        node_id=node_id
+                    )
+                    chunks.append(chunk)
             
             # File summary
             file_summary = f"// Module: {module_name}\n// File: {os.path.basename(file_path)}\n"
@@ -546,7 +634,7 @@ class SpringBootIndexer:
                 chunk_type=row[5],
                 name=row[6],
                 package=row[7],
-                annotations=json.loads(row[8]),
+                annotations=json.loads(row[8]) if row[8] else [],
                 embedding=embedding,
                 node_id=row[0]
             )
@@ -599,7 +687,6 @@ class SpringBootAssistant:
                 if chunk.node_id not in visited:
                     enriched_results.append((chunk, score))
                     visited.add(chunk.node_id)
-                    # DFS to find related nodes (CALLS, EXTENDS, IMPLEMENTS)
                     result = session.run(
                         """
                         MATCH (start:CodeChunk {node_id: $node_id})
@@ -623,11 +710,11 @@ class SpringBootAssistant:
                                 chunk_type=record[5],
                                 name=record[6],
                                 package=record[7],
-                                annotations=json.loads(record[8]),
+                                annotations=json.loads(record[8]) if record[8] else [],
                                 embedding=np.array(record[9], dtype=np.float32) if record[9] else None,
                                 node_id=related_node_id
                             )
-                            enriched_results.append((related_chunk, score * 0.8))  # Lower score for related nodes
+                            enriched_results.append((related_chunk, score * 0.8))
                             visited.add(related_node_id)
         
         return enriched_results[:top_k]
@@ -645,8 +732,8 @@ class SpringBootAssistant:
                 with open(current_file, 'r', encoding='utf-8') as f:
                     current_content = f.read()
                 current_chars = len(current_content)
-                if current_chars < max_chars // 3:
-                    context_parts.append(f"=== CURRENT FILE ({current_file}) ===\n{current_content}\n\n")
+                if current_chars < max_chars:
+                    context_parts.append(f"// Current File: {current_file}\n\n{current_content}\n\n")
                     total_chars += current_chars
             except Exception as e:
                 print(f"Error reading current file: {e}")
@@ -662,8 +749,8 @@ class SpringBootAssistant:
         for chunk_type in type_order:
             if chunk_type in chunks_by_type:
                 for chunk, score in chunks_by_type[chunk_type]:
-                    annotations_str = f" [{', '.join(chunk.annotations)}]" if chunk.annotations else ""
-                    chunk_text = f"\n--- {chunk.chunk_type.upper()}: {chunk.name}{annotations_str} ---\n"
+                    annotations_str = f" [{', '.join(chunk.annotations)}]" if chunk.annotation else []
+                    chunk_text = f"\n--- {chunk.chunk_type.upper()}: {chunk.name}{annotations_str} ---n"
                     chunk_text += f"File: {chunk.file_path}\n"
                     if chunk.package:
                         chunk_text += f"Package: {chunk.package}\n"
@@ -678,28 +765,29 @@ class SpringBootAssistant:
     
     def ask_question(self, query: str, current_file: str = None) -> str:
         context = self.build_context(query, current_file)
-        prompt = f"""You are an expert Spring Boot developer assistant. Answer the user's question based on the provided codebase context.
+        prompt = f"""
+        You are an expert Spring Boot developer assistant. Answer the user's question based on the provided codebase context.
 
-Focus on:
-- Spring Boot specific patterns and annotations
-- Multi-module project structure
-- Configuration management
-- RESTful API design
-- Dependency injection patterns
-- Database integration
-- Security configurations
+        Focus on:
+        - Spring Boot specific patterns and annotations
+        - Multi-module project structure
+        - Configuration management
+        - RESTful API design
+        - Dependency injection patterns
+        - Database integration
+        - Security configurations
 
-{context}
+        {context}
 
-Question: {query}
+        Question: {query}
 
-Provide a detailed answer with specific references to the code, files, and Spring Boot concepts. If you mention specific classes or methods, include their package names."""
+        Provide a detailed answer with specific references to the code, files, and Spring Boot concepts. If you mention specific classes or methods, include their package names."""
         print("Generating response with Mistral...")
         response = self.llm.generate(prompt, max_tokens=2000, temperature=0.2)
         return response
 
 def add_index(codebase_name: str, path: str, embedding_model: str = 'nomic-embed-text', 
-              neo4j_uri: str = "bolt://localhost:7687", neo4j_user: str = "neo4j", neo4j_password: str = "password") -> bool:
+                neo4j_uri: str = "bolt://localhost:7687", neo4j_user: str = "neo4j", neo4j_password: str = "password") -> bool:
     """
     Index a Spring Boot codebase with a given name and path.
     
@@ -718,7 +806,7 @@ def add_index(codebase_name: str, path: str, embedding_model: str = 'nomic-embed
         if not os.path.exists(path):
             print(f"Error: Path '{path}' does not exist.")
             return False
-        
+            
         print(f"Starting indexing process for codebase: {codebase_name}")
         indexer = SpringBootIndexer(codebase_name, embedding_model, neo4j_uri, neo4j_user, neo4j_password)
         indexer.index_codebase(path)
@@ -732,7 +820,7 @@ def query(codebase_name: str, query_str: str, llm_model: str = 'mistral:7b',
           embedding_model: str = 'nomic-embed-text', neo4j_uri: str = "bolt://localhost:7687", 
           neo4j_user: str = "neo4j", neo4j_password: str = "password") -> str:
     """
-    Query a specific Spring Boot codebase with a question.
+    Query a specific codebase with a question.
     
     Args:
         codebase_name: Name of the indexed codebase
@@ -744,22 +832,27 @@ def query(codebase_name: str, query_str: str, llm_model: str = 'mistral:7b',
         neo4j_password: Neo4j password
     
     Returns:
-        Answer to the question as a string
+        str: Answer to the question
     """
     try:
         indexer = SpringBootIndexer(codebase_name, embedding_model, neo4j_uri, neo4j_user, neo4j_password)
         if not indexer.load_from_database():
-            return f"Error: No indexed codebase found with name '{codebase_name}'. Please index it first using add_index()."
+            return f"Error: No indexed codebase found for '{codebase_name}'. Please index it first using add_index()."
         
         assistant = SpringBootAssistant(indexer, llm_model)
         response = assistant.ask_question(query_str)
         return response
     except Exception as e:
-        return f"Error processing query for codebase '{codebase_name}': {e}"
+        return f"Error processing query for '{codebase_name}': {str(e)}"
 
 def list_codebases(neo4j_uri: str = "bolt://localhost:7687", neo4j_user: str = "neo4j", neo4j_password: str = "password") -> List[Dict[str, str]]:
     """
     List all indexed codebases.
+    
+    Args:
+        neo4j_uri: Neo4j connection URI
+        neo4j_user: Neo4j username
+        neo4j_password: Neo4j password
     
     Returns:
         List of dictionaries containing codebase information
@@ -788,7 +881,7 @@ def list_codebases(neo4j_uri: str = "bolt://localhost:7687", neo4j_user: str = "
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='Spring Boot Code Assistant with Neo4j and Tree-Sitter')
+    parser = argparse.ArgumentParser(description='Spring Boot Assistant with Neo4j and Tree-Sitter')
     parser.add_argument('--index', nargs=2, metavar=('CODEBASE_NAME', 'PATH'), 
                         help='Index a codebase: --index my_project /path/to/project')
     parser.add_argument('--query', nargs=2, metavar=('CODEBASE_NAME', 'QUESTION'), 
@@ -809,13 +902,8 @@ def main():
             print("No indexed codebases found.")
         else:
             print("Indexed Codebases:")
-            print("-" * 60)
-            for cb in codebases:
-                print(f"Name: {cb['name']}")
-                print(f"Path: {cb['root_path']}")
-                print(f"Indexed: {cb['indexed_at']}")
-                print(f"Chunks: {cb['total_chunks']}")
-                print("-" * 60)
+            for i, cb in enumerate(codebases, 1):
+                print(f"{i}. {cb['name']} ({cb['total_chunks']} chunks, Path: {cb['root_path']}, Indexed: {cb['indexed_at']}")
         return
     
     if args.index:
@@ -831,14 +919,12 @@ def main():
         codebase_name, question = args.query
         print(f"Querying codebase '{codebase_name}'...")
         response = query(codebase_name, question, args.llm_model, args.embedding_model, 
-                        args.neo4j_uri, args.neo4j_user, args.neo4j_password)
-        print("\n" + "="*60)
-        print(f"SPRING BOOT ASSISTANT ANSWER ({codebase_name}):")
- print("="*60)
+                        args.neo4j_uri, args['neo4j_user'], args['neo4j_password'])
+        print("\nSPRING BOOT ASSISTANT ANSWER:")
         print(response)
         return
     
-    codebases = list_codebases(args.neo4j_uri, args.neo4j_user, args.neo4j_password)
+    codebases = list_codebases(args.neo4j_uri, args['neo4j_user'], args['neo4j_password'])
     if not codebases:
         print("No indexed codebases found. Please index a codebase first:")
         print("python script.py --index <codebase_name> <path_to_project>")
@@ -851,13 +937,13 @@ def main():
     try:
         choice = int(input("\nSelect a codebase (number): ")) - 1
         if choice < 0 or choice >= len(codebases):
-            print("Invalid selection.")
+            print("Invalid choice.")
             return
         
         selected_codebase = codebases[choice]['name']
         print(f"\nSelected codebase: {selected_codebase}")
         
-        indexer = SpringBootIndexer(selected_codebase, args.embedding_model, args.neo4j_uri, args.neo4j_user, args.neo4j_password)
+        indexer = SpringBootIndexer(selected_codebase, args.embedding_model, args.neo4j_uri, args['neo4j_user'], args['neo4j_password'])
         if not indexer.load_from_database():
             print(f"Error loading codebase '{selected_codebase}'")
             return
@@ -865,15 +951,15 @@ def main():
         assistant = SpringBootAssistant(indexer, args.llm_model)
         print(f"\nSpring Boot Assistant - Interactive Mode ({selected_codebase})")
         print(f"Modules: {', '.join(indexer.modules.keys())}")
-        print("Type 'quit' to exit, 'file: /path/to/file.java' to set current file context")
-        print("Type 'switch' to switch to another codebase")
+        print("Type 'quit' to exit, 'file: <path>' to set current file, 'switch' to change codebase")
         
         current_file = args.file
         while True:
             query = input(f"\n[{selected_codebase}] Question: ").strip()
-            if query.lower() in ['quit', 'exit', 'q']:
+            if query.lower() in ['quit', 'exit']:
                 break
             if query.lower() == 'switch':
+                codebases = list_codebases(args['neo4j_uri'], args['neo4j_user'], args['neo4j_password'])
                 print("\nAvailable codebases:")
                 for i, cb in enumerate(codebases, 1):
                     print(f"{i}. {cb['name']} ({cb['total_chunks']} chunks)")
@@ -881,51 +967,30 @@ def main():
                     choice = int(input("\nSelect a codebase (number): ")) - 1
                     if 0 <= choice < len(codebases):
                         selected_codebase = codebases[choice]['name']
-                        indexer = SpringBootIndexer(selected_codebase, args.embedding_model, args.neo4j_uri, args.neo4j_user, args.neo4j_password)
+                        indexer = SpringBootIndexer(selected_codebase, args.embedding_model, args['neo4j_uri'], args['neo4j_user'], args['neo4j_password'])
                         if indexer.load_from_database():
                             assistant = SpringBootAssistant(indexer, args.llm_model)
                             print(f"Switched to codebase: {selected_codebase}")
                         else:
-                            print(f"Error loading codebase '{selected_codebase}'")
+                            print(f"Error loading codebase '{selected_action}'")
                     else:
-                        print("Invalid selection.")
+                        print("Invalid choice.")
                 except ValueError:
                     print("Invalid input.")
                 continue
             if query.startswith('file:'):
                 current_file = query[5:].strip()
-                print(f"Current file set to: {current_file}")
+                print(f"Set current file to: {current_file}")
                 continue
             if not query:
                 continue
             response = assistant.ask_question(query, current_file)
-            print("\n" + "="*60)
-            print(f"ANSWER ({selected_codebase}):")
-            print("="*60)
+            print("\nSpring Boot Assistant Response:")
             print(response)
     except ValueError:
         print("Invalid input.")
     except KeyboardInterrupt:
-        print("\nGoodbye!")
+        print("\nExiting...")
 
 if __name__ == "__main__":
-    # Build tree-sitter Java language library if not already built
-    if not os.path.exists('build/java.so'):
-        from tree_sitter import Language
-        Language.build_library('build/java.so', ['vendor/tree-sitter-java'])
     main()
-
-# Example usage:
-"""
-# Index a codebase
-add_index("my_ecommerce_app", "/path/to/ecommerce/project")
-
-# Query a codebase
-response = query("my_ecommerce_app", "How is user authentication implemented?")
-print(response)
-
-# List all codebases
-codebases = list_codebases()
-for cb in codebases:
-    print(f"Codebase: {cb['name']}, Chunks: {cb['total_chunks']}")
-"""
